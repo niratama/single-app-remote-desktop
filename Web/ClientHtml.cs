@@ -267,6 +267,16 @@ public static class ClientHtml
                 }
             });
 
+            canvas.addEventListener("pointercancel", (e) => {
+                if (!isPointerDown) return;
+                isPointerDown = false;
+                if (dragMode && targetState !== "closed") {
+                    const { x, y } = getRelativeCoords(e);
+                    const isRight = e.button === 2 || rightClickMode;
+                    sendJson({ type: "pointerup", x, y, button: isRight ? 2 : 0 });
+                }
+            });
+
             canvas.addEventListener("wheel", (e) => {
                 if (targetState === "closed") return;
                 e.preventDefault();
@@ -338,7 +348,7 @@ public static class ClientHtml
 
             function connect() {
                 const proto = location.protocol === "https:" ? "wss:" : "ws:";
-                ws = new WebSocket(`${proto}//${location.host}/ws`);
+                ws = new WebSocket(`${proto}//${location.host}/ws${location.search}`);
                 ws.binaryType = "blob";
 
                 ws.onopen = () => {
@@ -374,13 +384,19 @@ public static class ClientHtml
                     }
                 };
 
-                ws.onclose = () => {
+                ws.onclose = (event) => {
                     statusDot.className = "dot";
-                    statusText.textContent = "サーバー切断 (再接続待機中...)";
                     canvas.classList.add("inactive");
+                    overlayBox.style.display = "block";
+                    if (event && event.code === 1008) {
+                        statusText.textContent = "認証エラー (アクセス拒否)";
+                        overlayTitle.textContent = "アクセストークンが無効、または指定されていません";
+                        overlaySub.textContent = "URLに ?token=<トークン> を付与して再度アクセスしてください";
+                        return;
+                    }
+                    statusText.textContent = "サーバー切断 (再接続待機中...)";
                     overlayTitle.textContent = "ホストサーバーとの接続が切断されました";
                     overlaySub.textContent = "自動的に再接続を試みています...";
-                    overlayBox.style.display = "block";
                     setTimeout(connect, 1500);
                 };
             }

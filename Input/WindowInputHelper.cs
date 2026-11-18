@@ -8,15 +8,25 @@ namespace SingleAppRemote.Input;
 
 public static class WindowInputHelper
 {
+    private const int MaxQueuedInputs = 64;
+    private const int MaxTextLength = 256;
+
     private sealed record QueuedInput(HostConfig Config, JsonElement Payload);
 
-    private static readonly Channel<QueuedInput> InputChannel = Channel.CreateUnbounded<QueuedInput>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    private static readonly Channel<QueuedInput> InputChannel = Channel.CreateBounded<QueuedInput>(
+        new BoundedChannelOptions(MaxQueuedInputs)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
 
     private static readonly object StateLock = new();
     private static NativeMethods.POINT? _savedHostCursor;
     private static CancellationTokenSource? _restoreCursorCts;
     private static bool _isDragging;
+    private static int _dragButton;
+    private static InputMode _lastDragMode = InputMode.SendInputRestoreCursor;
 
     static WindowInputHelper()
     {
@@ -26,8 +36,45 @@ public static class WindowInputHelper
 
     public static void HandleClientMessage(HostConfig config, JsonElement root)
     {
+        if (config.IsHostDialogOpen) return;
+
         // JsonDocument が Dispose されても安全なように Clone して非同期キューへ即座に積む（WebSocket受信を一切止めない）
         InputChannel.Writer.TryWrite(new QueuedInput(config, root.Clone()));
+    }
+
+    /// <summary>
+    /// クライアント切断時またはターゲット変更時に滞留キューを破棄し、ドラッグ押しっぱなし状態を安全に解除する
+    /// </summary>
+    public static void OnClientDisconnected(InputMode currentMode)
+    {
+        while (InputChannel.Reader.TryRead(out _)) { }
+        ReleaseDragIfActive(currentMode);
+    }
+
+    public static void ReleaseDragIfActive(InputMode mode)
+    {
+        bool wasDragging = false;
+        int btn = 0;
+        InputMode activeMode = mode;
+
+        lock (StateLock)
+        {
+            if (_isDragging)
+            {
+                wasDragging = true;
+                btn = _dragButton;
+                activeMode = _lastDragMode;
+                _isDragging = false;
+                _dragButton = 0;
+            }
+        }
+
+        if (wasDragging && activeMode != InputMode.PostMessage)
+        {
+            uint upFlag = btn == 2 ? NativeMethods.MOUSEEVENTF_RIGHTUP : NativeMethods.MOUSEEVENTF_LEFTUP;
+            NativeMethods.mouse_event(upFlag, 0, 0, 0, UIntPtr.Zero);
+            ScheduleCursorRestore(activeMode, 50);
+        }
     }
 
     private static async Task ProcessInputQueueAsync()
@@ -47,7 +94,8 @@ public static class WindowInputHelper
 
     private static void ProcessSingleMessage(HostConfig config, JsonElement root)
     {
-        if (!root.TryGetProperty("type", out var typeProp)) return;
+        if (config.IsHostDialogOpen) return;
+        if (!root.TryGetProperty("type", out var typeProp) || typeProp.ValueKind != JsonValueKind.String) return;
         var type = typeProp.GetString();
         if (string.IsNullOrEmpty(type)) return;
 
@@ -70,31 +118,38 @@ public static class WindowInputHelper
             case "pointerup":
             {
                 if (!TryGetClampedCoords(hwnd, root, out int absX, out int absY)) return;
-                int button = root.TryGetProperty("button", out var btnProp) ? btnProp.GetInt32() : 0;
+                int button = root.TryGetProperty("button", out var btnProp) &&
+                             btnProp.ValueKind == JsonValueKind.Number &&
+                             btnProp.TryGetInt32(out int b) && b == 2 ? 2 : 0;
                 ExecutePointerDrag(hwnd, mode, absX, absY, type, button);
                 break;
             }
             case "wheel":
             {
                 if (!TryGetClampedCoords(hwnd, root, out int absX, out int absY)) return;
-                int deltaY = root.TryGetProperty("deltaY", out var dyProp) ? (int)dyProp.GetDouble() : 0;
+                int deltaY = root.TryGetProperty("deltaY", out var dyProp) &&
+                             dyProp.ValueKind == JsonValueKind.Number &&
+                             dyProp.TryGetDouble(out double rawDy) &&
+                             double.IsFinite(rawDy)
+                    ? Math.Sign(rawDy)
+                    : 0;
                 ExecuteMouseWheel(hwnd, mode, absX, absY, deltaY);
                 break;
             }
             case "key":
             {
-                string key = root.TryGetProperty("key", out var kProp) ? kProp.GetString() ?? "" : "";
-                string code = root.TryGetProperty("code", out var cProp) ? cProp.GetString() ?? "" : "";
-                bool alt = root.TryGetProperty("altKey", out var aProp) && aProp.GetBoolean();
-                bool ctrl = root.TryGetProperty("ctrlKey", out var ctrlProp) && ctrlProp.GetBoolean();
-                bool shift = root.TryGetProperty("shiftKey", out var sProp) && sProp.GetBoolean();
-                bool meta = root.TryGetProperty("metaKey", out var mProp) && mProp.GetBoolean();
-                ExecuteKeyPress(hwnd, mode, key, code, ctrl, alt, shift, meta);
+                string key = root.TryGetProperty("key", out var kProp) && kProp.ValueKind == JsonValueKind.String ? kProp.GetString() ?? "" : "";
+                string code = root.TryGetProperty("code", out var cProp) && cProp.ValueKind == JsonValueKind.String ? cProp.GetString() ?? "" : "";
+                bool alt = root.TryGetProperty("altKey", out var aProp) && aProp.ValueKind is JsonValueKind.True or JsonValueKind.False && aProp.GetBoolean();
+                bool ctrl = root.TryGetProperty("ctrlKey", out var ctrlProp) && ctrlProp.ValueKind is JsonValueKind.True or JsonValueKind.False && ctrlProp.GetBoolean();
+                bool shift = root.TryGetProperty("shiftKey", out var sProp) && sProp.ValueKind is JsonValueKind.True or JsonValueKind.False && sProp.GetBoolean();
+                bool meta = root.TryGetProperty("metaKey", out var mProp) && mProp.ValueKind is JsonValueKind.True or JsonValueKind.False && mProp.GetBoolean();
+                ExecuteKeyPress(hwnd, mode, key, code, ctrl, alt, shift, meta, config.BlockShellShortcuts);
                 break;
             }
             case "text":
             {
-                string text = root.TryGetProperty("text", out var tProp) ? tProp.GetString() ?? "" : "";
+                string text = root.TryGetProperty("text", out var tProp) && tProp.ValueKind == JsonValueKind.String ? tProp.GetString() ?? "" : "";
                 if (!string.IsNullOrEmpty(text))
                 {
                     ExecuteTextInput(hwnd, mode, text);
@@ -167,6 +222,12 @@ public static class WindowInputHelper
         absY = 0;
         if (!root.TryGetProperty("x", out var xProp) || !root.TryGetProperty("y", out var yProp))
             return false;
+        if (xProp.ValueKind != JsonValueKind.Number || yProp.ValueKind != JsonValueKind.Number)
+            return false;
+        if (!xProp.TryGetDouble(out double rawX) || !yProp.TryGetDouble(out double rawY))
+            return false;
+        if (!double.IsFinite(rawX) || !double.IsFinite(rawY))
+            return false;
 
         // 【重要】最小化中のウィンドウは座標が (-32000, -32000) またはタスクバー左端（スタートボタン付近）になるため、
         // 座標計算をする前に必ず最小化を解除し、DWM アニメーションが終わって正常な画面内矩形に戻るまで待機する。
@@ -193,8 +254,8 @@ public static class WindowInputHelper
             return false;
         }
 
-        double relX = Math.Clamp(xProp.GetDouble(), 0.0, 1.0);
-        double relY = Math.Clamp(yProp.GetDouble(), 0.0, 1.0);
+        double relX = Math.Clamp(rawX, 0.0, 1.0);
+        double relY = Math.Clamp(rawY, 0.0, 1.0);
 
         int width = Math.Max(1, rect.Width);
         int height = Math.Max(1, rect.Height);
@@ -209,6 +270,45 @@ public static class WindowInputHelper
     {
         // 最小化時の特殊座標 (-32000, -32000) や極小矩形を弾く
         return rect.Left > -10000 && rect.Top > -10000 && rect.Width >= 32 && rect.Height >= 32;
+    }
+
+    /// <summary>
+    /// 指定したスクリーン座標の最前面ウィンドウが対象ウィンドウ（またはその子/所有ポップアップ）であるかを検証し、
+    /// 前面に重なった別ウィンドウや自身のダイアログへのクリック貫通を防ぐ。
+    /// </summary>
+    private static bool IsPointOnTargetWindow(IntPtr targetHwnd, int screenX, int screenY)
+    {
+        IntPtr hit = NativeMethods.WindowFromPoint(new NativeMethods.POINT { X = screenX, Y = screenY });
+        if (hit == IntPtr.Zero) return false;
+
+        NativeMethods.GetWindowThreadProcessId(hit, out uint hitPid);
+        if (hitPid == (uint)Environment.ProcessId) return false;
+
+        if (hit == targetHwnd) return true;
+        if (NativeMethods.GetAncestor(hit, NativeMethods.GA_ROOT) == targetHwnd) return true;
+        if (NativeMethods.GetAncestor(hit, NativeMethods.GA_ROOTOWNER) == targetHwnd) return true;
+
+        NativeMethods.GetWindowThreadProcessId(targetHwnd, out uint targetPid);
+        return hitPid != 0 && hitPid == targetPid;
+    }
+
+    /// <summary>
+    /// キーボード入力注入時にフォアグラウンドウィンドウが対象ウィンドウであることを検証する。
+    /// </summary>
+    private static bool IsTargetWindowForeground(IntPtr targetHwnd)
+    {
+        IntPtr fg = NativeMethods.GetForegroundWindow();
+        if (fg == IntPtr.Zero) return false;
+
+        NativeMethods.GetWindowThreadProcessId(fg, out uint fgPid);
+        if (fgPid == (uint)Environment.ProcessId) return false;
+
+        if (fg == targetHwnd) return true;
+        if (NativeMethods.GetAncestor(fg, NativeMethods.GA_ROOT) == targetHwnd) return true;
+        if (NativeMethods.GetAncestor(fg, NativeMethods.GA_ROOTOWNER) == targetHwnd) return true;
+
+        NativeMethods.GetWindowThreadProcessId(targetHwnd, out uint targetPid);
+        return fgPid != 0 && fgPid == targetPid;
     }
 
     private static void EnsureWindowActive(IntPtr hwnd)
@@ -268,6 +368,11 @@ public static class WindowInputHelper
 
         SaveCursorBeforeAction(mode);
         EnsureWindowActive(hwnd);
+        if (!IsPointOnTargetWindow(hwnd, absX, absY))
+        {
+            ScheduleCursorRestore(mode);
+            return;
+        }
 
         // 1. カーソル移動 + MOVE イベントで UWP/XAML にボタン上のホバーを即認識させる
         NativeMethods.SetCursorPos(absX, absY);
@@ -301,19 +406,31 @@ public static class WindowInputHelper
             IntPtr lParam = NativeMethods.MakeLParam(clientPt.X, clientPt.Y);
             if (evType == "pointerdown")
             {
-                _isDragging = true;
+                lock (StateLock)
+                {
+                    _isDragging = true;
+                    _dragButton = button;
+                    _lastDragMode = mode;
+                }
                 uint msg = button == 2 ? NativeMethods.WM_RBUTTONDOWN : NativeMethods.WM_LBUTTONDOWN;
                 int mk = button == 2 ? NativeMethods.MK_RBUTTON : NativeMethods.MK_LBUTTON;
                 NativeMethods.PostMessage(targetChild, msg, (IntPtr)mk, lParam);
             }
             else if (evType == "pointermove" && _isDragging)
             {
-                NativeMethods.PostMessage(targetChild, NativeMethods.WM_MOUSEMOVE, (IntPtr)NativeMethods.MK_LBUTTON, lParam);
+                int mk = _dragButton == 2 ? NativeMethods.MK_RBUTTON : NativeMethods.MK_LBUTTON;
+                NativeMethods.PostMessage(targetChild, NativeMethods.WM_MOUSEMOVE, (IntPtr)mk, lParam);
             }
             else if (evType == "pointerup" && _isDragging)
             {
-                _isDragging = false;
-                uint msg = button == 2 ? NativeMethods.WM_RBUTTONUP : NativeMethods.WM_LBUTTONUP;
+                int activeBtn;
+                lock (StateLock)
+                {
+                    activeBtn = _dragButton;
+                    _isDragging = false;
+                    _dragButton = 0;
+                }
+                uint msg = activeBtn == 2 ? NativeMethods.WM_RBUTTONUP : NativeMethods.WM_LBUTTONUP;
                 NativeMethods.PostMessage(targetChild, msg, IntPtr.Zero, lParam);
             }
             return;
@@ -322,21 +439,41 @@ public static class WindowInputHelper
         if (evType == "pointerdown")
         {
             SaveCursorBeforeAction(mode);
-            _isDragging = true;
             EnsureWindowActive(hwnd);
+            if (!IsPointOnTargetWindow(hwnd, absX, absY))
+            {
+                ScheduleCursorRestore(mode);
+                return;
+            }
+            lock (StateLock)
+            {
+                _isDragging = true;
+                _dragButton = button;
+                _lastDragMode = mode;
+            }
             NativeMethods.SetCursorPos(absX, absY);
             uint downFlag = button == 2 ? NativeMethods.MOUSEEVENTF_RIGHTDOWN : NativeMethods.MOUSEEVENTF_LEFTDOWN;
             NativeMethods.mouse_event(downFlag, 0, 0, 0, UIntPtr.Zero);
         }
         else if (evType == "pointermove" && _isDragging)
         {
+            if (!IsPointOnTargetWindow(hwnd, absX, absY)) return;
             NativeMethods.SetCursorPos(absX, absY);
         }
         else if (evType == "pointerup" && _isDragging)
         {
-            _isDragging = false;
-            NativeMethods.SetCursorPos(absX, absY);
-            uint upFlag = button == 2 ? NativeMethods.MOUSEEVENTF_RIGHTUP : NativeMethods.MOUSEEVENTF_LEFTUP;
+            int activeBtn;
+            lock (StateLock)
+            {
+                activeBtn = _dragButton;
+                _isDragging = false;
+                _dragButton = 0;
+            }
+            if (IsPointOnTargetWindow(hwnd, absX, absY))
+            {
+                NativeMethods.SetCursorPos(absX, absY);
+            }
+            uint upFlag = activeBtn == 2 ? NativeMethods.MOUSEEVENTF_RIGHTUP : NativeMethods.MOUSEEVENTF_LEFTUP;
             NativeMethods.mouse_event(upFlag, 0, 0, 0, UIntPtr.Zero);
             ScheduleCursorRestore(mode);
         }
@@ -358,6 +495,11 @@ public static class WindowInputHelper
 
         SaveCursorBeforeAction(mode);
         EnsureWindowActive(hwnd);
+        if (!IsPointOnTargetWindow(hwnd, absX, absY))
+        {
+            ScheduleCursorRestore(mode);
+            return;
+        }
         NativeMethods.SetCursorPos(absX, absY);
         NativeMethods.mouse_event(NativeMethods.MOUSEEVENTF_WHEEL, 0, 0, wheelDelta, UIntPtr.Zero);
         ScheduleCursorRestore(mode);
@@ -365,10 +507,10 @@ public static class WindowInputHelper
 
     private static void ExecuteKeyPress(
         IntPtr hwnd, InputMode mode, string key, string code,
-        bool ctrl, bool alt, bool shift, bool meta)
+        bool ctrl, bool alt, bool shift, bool meta, bool blockShellShortcuts)
     {
-        // Kiosk 脱出防止フィルタ: システムショートカット・Winキー・タスク切り替え等を完全遮断
-        if (IsBlockedSystemShortcut(key, code, ctrl, alt, shift, meta))
+        // Kiosk 脱出防止フィルタ: システムショートカット・Winキー・タスク切り替え・シェル起動等を遮断
+        if (IsBlockedSystemShortcut(key, code, ctrl, alt, shift, meta, blockShellShortcuts))
         {
             return;
         }
@@ -393,6 +535,8 @@ public static class WindowInputHelper
         }
 
         EnsureWindowActive(hwnd);
+        if (!IsTargetWindowForeground(hwnd)) return;
+
         var inputs = new List<NativeMethods.INPUT>(8);
         if (ctrl) AddKeyInput(inputs, 0x11, false); // VK_CONTROL
         if (useShift) AddKeyInput(inputs, 0x10, false); // VK_SHIFT
@@ -412,19 +556,28 @@ public static class WindowInputHelper
 
     private static void ExecuteTextInput(IntPtr hwnd, InputMode mode, string text)
     {
+        if (text.Length > MaxTextLength)
+        {
+            text = text[..MaxTextLength];
+        }
+
         if (mode == InputMode.PostMessage)
         {
             foreach (char ch in text)
             {
+                if (char.IsControl(ch)) continue;
                 NativeMethods.PostMessage(hwnd, NativeMethods.WM_CHAR, (IntPtr)ch, IntPtr.Zero);
             }
             return;
         }
 
         EnsureWindowActive(hwnd);
+        if (!IsTargetWindowForeground(hwnd)) return;
+
         var inputs = new List<NativeMethods.INPUT>(text.Length * 2);
         foreach (char ch in text)
         {
+            if (char.IsControl(ch)) continue;
             inputs.Add(new NativeMethods.INPUT
             {
                 type = NativeMethods.INPUT_KEYBOARD,
@@ -453,6 +606,7 @@ public static class WindowInputHelper
             });
         }
 
+        if (inputs.Count == 0) return;
         var arr = inputs.ToArray();
         NativeMethods.SendInput((uint)arr.Length, arr, Marshal.SizeOf<NativeMethods.INPUT>());
     }
@@ -474,33 +628,59 @@ public static class WindowInputHelper
     }
 
     public static bool IsBlockedSystemShortcut(
-        string key, string code, bool ctrl, bool alt, bool shift, bool meta)
+        string key, string code, bool ctrl, bool alt, bool shift, bool meta, bool blockShellShortcuts = true)
     {
-        // Windows / Meta キーは常に遮断
+        // Windows / Meta キーおよびコンテキストメニューキーは常に遮断
         if (meta ||
             key.Equals("Meta", StringComparison.OrdinalIgnoreCase) ||
             key.Equals("OS", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("ContextMenu", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("Apps", StringComparison.OrdinalIgnoreCase) ||
             code.Equals("MetaLeft", StringComparison.OrdinalIgnoreCase) ||
-            code.Equals("MetaRight", StringComparison.OrdinalIgnoreCase))
+            code.Equals("MetaRight", StringComparison.OrdinalIgnoreCase) ||
+            code.Equals("ContextMenu", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
-        // Alt + Tab / Alt + Esc / Alt + F4 / Alt + Space を遮断
+        // F1 (外部ブラウザ・Windowsヘルプ起動) および Shift+F10 (コンテキストメニュー) を遮断
+        if (key.Equals("F1", StringComparison.OrdinalIgnoreCase) ||
+            (shift && key.Equals("F10", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        // Alt + Tab / Alt + Esc / Alt + F4 / Alt + Space / Alt + D を遮断
         if (alt && (
             key.Equals("Tab", StringComparison.OrdinalIgnoreCase) ||
             key.Equals("Escape", StringComparison.OrdinalIgnoreCase) ||
             key.Equals("F4", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("d", StringComparison.OrdinalIgnoreCase) ||
             key.Equals(" ", StringComparison.OrdinalIgnoreCase) ||
             code.Equals("Space", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
 
-        // Ctrl + Esc / Ctrl + Shift + Esc / Ctrl + Alt + Del を遮断
+        // Ctrl + Esc / Ctrl + Shift + Esc / Ctrl + Alt + Del / Ctrl + F4 を遮断
         if (ctrl && (
             key.Equals("Escape", StringComparison.OrdinalIgnoreCase) ||
-            key.Equals("Delete", StringComparison.OrdinalIgnoreCase)))
+            key.Equals("Delete", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("F4", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        // Kiosk保護有効時: ファイルダイアログ（エクスプローラーシェル経由の任意コマンド実行）や新規ウィンドウ起動ショートカットを遮断
+        if (blockShellShortcuts && ctrl && (
+            key.Equals("o", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("s", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("p", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("n", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("t", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("w", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("l", StringComparison.OrdinalIgnoreCase) ||
+            key.Equals("r", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }

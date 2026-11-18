@@ -10,8 +10,9 @@ Windows 10 / 11 上の **「指定した1つのアプリケーションウィン
 
 ### 1. 厳格な Kiosk 制限（リモート側から他のアプリへ出られない設計）
 - **ホストPC側専用のターゲット選択**: Webクライアント（ブラウザ）側にはウィンドウ一覧取得や切り替え用の API を一切公開していません。キャプチャ対象の変更はホストPC側のタスクトレイ（または起動引数）からのみ行えます。
-- **ウィンドウ内への座標クランプ & DWM フレーム補正**: ブラウザからは相対座標（`0.0 〜 1.0`）のみを受け取り、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` で透明なドロップシャドウ枠を除いた実際のウィンドウ矩形内に厳密にクランプします。また、最小化時の異常座標（`-32000, -32000`）によるスタートメニュー誤爆も防止しています。
-- **システムショートカットの遮断**: `Win` キー、`Alt+Tab`、`Alt+F4`、`Alt+Esc`、`Ctrl+Shift+Esc`、`Ctrl+Alt+Del` などのOS操作キーはサーバー側でフィルタリング・破棄されます。
+- **ウィンドウ内への座標クランプ & 前面ウィンドウ検証 (`WindowFromPoint`)**: ブラウザからは相対座標（`0.0 〜 1.0`）のみを受け取り、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` で透明なドロップシャドウ枠を除いた実際のウィンドウ矩形内に厳密にクランプします。さらにクリック直前にその座標の最前面ウィンドウが対象アプリ自身であることを検証し、前面に重なった別ウィンドウや自身の設定ダイアログへのクリック貫通を防止します。
+- **システム・シェル起動ショートカットの遮断**: `Win` キー、`Alt+Tab`、`Alt+F4`、`Alt+Esc`、`Ctrl+Shift+Esc`、`Ctrl+Alt+Del`、`F1`、`Shift+F10` に加え、Kiosk保護有効時はファイルダイアログ等を開く `Ctrl+O` / `Ctrl+S` / `Ctrl+P` / `Ctrl+N` 等もサーバー側で遮断します。
+- **WebSocket 保護 & トークン認証**: `Origin` ヘッダー検証による CSWSH（Cross-Site WebSocket Hijacking）防止、同時接続数・入力キュー上限による DoS 防止、および任意のアクセストークン認証（`--token` / `--generate-token`）に対応しています。
 
 ### 2. 高速キャプチャ（Windows Graphics Capture + Direct3D11）
 - **背面ウィンドウでもキャプチャ可能**: WGC API を使用しているため、対象ウィンドウの上に別のウィンドウが重なっていても（最小化さえされていなければ）、対象ウィンドウ単体の映像を GPU 経由で高速に取得・配信します。
@@ -27,9 +28,10 @@ Windows 10 / 11 上の **「指定した1つのアプリケーションウィン
 3. **`PostMessage`**:
    - ホストのマウスカーソルもウィンドウフォーカスも一切奪わず、バックグラウンドで直接子ウィンドウへ `WM_LBUTTONDOWN` / `WM_CHAR` 等を送信します（従来のネイティブ Win32 アプリ向け）。
 
-### 4. タスクトレイ常駐 & インクリメンタル検索付きウィンドウ選択ダイアログ
+### 4. タスクトレイ常駐 & ウィンドウ選択・詳細設定ダイアログ
 - ダブルクリック起動時は黒いコンソール画面を出さずにタスクトレイへ静かに常駐します（`WinExe`）。
 - タスクトレイアイコンの**左クリック**で「キャプチャ対象ウィンドウの選択」ダイアログが開き、ウィンドウタイトル・プロセス名・PID でインクリメンタル検索して即座に切り替えられます。
+- タスクトレイメニューの **「設定 (ネットワーク・認証・Kiosk保護)...」** から設定ダイアログを開き、待受URL、アクセストークン（ランダム生成・LAN接続用URLコピー機能付き）、FPS、JPEG画質、入力モード、Kiosk保護などをGUIで設定できます。変更した設定は Windows 標準の `%LocalAppData%\SingleAppRemote\settings.json` に自動保存され、次回起動時に復元されます。
 
 ---
 
@@ -69,7 +71,9 @@ Windows 10 / 11 上の **「指定した1つのアプリケーションウィン
     "TargetFps": 30,
     "JpegQuality": 75,
     "InputMode": "SendInputRestoreCursor",
-    "CaptureCursor": false
+    "CaptureCursor": false,
+    "BlockShellShortcuts": true,
+    "AccessToken": ""
   }
 }
 ```
@@ -84,6 +88,12 @@ SingleAppRemote.exe --url "http://0.0.0.0:9000"
 
 # 入力モードを指定して起動する (SendInputRestoreCursor | SendInputDirect | PostMessage)
 SingleAppRemote.exe --window "メモ帳" --mode PostMessage
+
+# アクセストークン認証を有効化して起動する（クライアントは http://<IP>:8000/?token=mysecret で接続）
+SingleAppRemote.exe --token "mysecret"
+
+# ランダムなアクセストークンを自動生成して起動する
+SingleAppRemote.exe --generate-token
 ```
 
 ---
@@ -97,14 +107,10 @@ dotnet run -c Release
 ```
 
 ### 単一 `.exe` ファイルの発行（ランタイム同梱・圧縮有効）
-.NET ランタイムがインストールされていない環境でも単体で動く `SingleAppRemote.exe` を `./publish` フォルダに出力します。
+`SingleAppRemote.csproj` に単一バイナリ発行設定が組み込まれているため、以下のコマンドだけで .NET ランタイム不要で動く `SingleAppRemote.exe` が `./publish` フォルダに出力されます。
 
 ```powershell
-dotnet publish -c Release -r win-x64 --self-contained true `
-  -p:PublishSingleFile=true `
-  -p:IncludeNativeLibrariesForSelfExtract=true `
-  -p:EnableCompressionInSingleFile=true `
-  -o ./publish
+dotnet publish
 ```
 
 ---
@@ -125,9 +131,10 @@ single-app-remote-desktop/
 │   ├── WgcWindowCapturer.cs     # Windows Graphics Capture セッション管理・動的ターゲット切替
 │   └── D3D11Helper.cs           # Direct3D11 COM vtable 直接呼び出し・VRAM→JPEG エンコード
 ├── Host/
-│   ├── HostConfig.cs            # スレッドセーフな設定・ウィンドウ列挙・ステータス管理
+│   ├── HostConfig.cs            # スレッドセーフな設定・ウィンドウ列挙・ステータス管理・永続化
 │   ├── TrayApplicationContext.cs# ホストPC専用タスクトレイ常駐メニュー
 │   ├── WindowPickerDialog.cs    # インクリメンタル検索付きウィンドウ選択モーダルダイアログ
+│   ├── SettingsDialog.cs        # ネットワーク・トークン認証・画質・Kiosk保護の設定ダイアログ
 │   └── AppIconGenerator.cs      # GDI+ によるベクターアイコン生成
 ├── Input/
 │   └── WindowInputHelper.cs     # 非同期入力キュー・デバウンス付きカーソル復帰・Kiosk 遮断フィルタ

@@ -42,6 +42,11 @@ internal static class NativeMethods
     // ShowWindow constants
     public const int SW_RESTORE = 9;
 
+    // GetAncestor flags
+    public const uint GA_PARENT = 1;
+    public const uint GA_ROOT = 2;
+    public const uint GA_ROOTOWNER = 3;
+
     // Window Messages
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
@@ -169,6 +174,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT Point);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
 
     [DllImport("user32.dll")]
     public static extern IntPtr ChildWindowFromPointEx(IntPtr hwndParent, POINT pt, uint uFlags);

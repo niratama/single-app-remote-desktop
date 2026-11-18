@@ -16,13 +16,16 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _qualityMenu;
     private readonly ToolStripMenuItem _fpsMenu;
     private readonly ToolStripMenuItem _statusItem;
-    private WindowPickerDialog? _activePickerDialog;
+    private readonly SynchronizationContext? _uiSyncContext;
+    private readonly Action _targetChangedHandler;
+    private Form? _activeDialog;
 
     public TrayApplicationContext(HostConfig config, string listenUrl, Action onExitRequested)
     {
         _config = config;
         _listenUrl = listenUrl;
         _onExitRequested = onExitRequested;
+        _uiSyncContext = SynchronizationContext.Current;
         _appIcon = AppIconGenerator.CreateAppIcon(64);
 
         _contextMenu = new ContextMenuStrip();
@@ -61,12 +64,34 @@ public sealed class TrayApplicationContext : ApplicationContext
             Checked = _config.CaptureCursor,
             CheckOnClick = true
         };
-        cursorItem.CheckedChanged += (_, _) => _config.CaptureCursor = cursorItem.Checked;
+        cursorItem.CheckedChanged += (_, _) =>
+        {
+            _config.CaptureCursor = cursorItem.Checked;
+            _config.SaveUserSettings();
+        };
         _contextMenu.Items.Add(cursorItem);
+
+        // Kiosk保護（シェル・ファイルダイアログ系ショートカット遮断）切替
+        var shellGuardItem = new ToolStripMenuItem("Kiosk保護: ファイル開く/保存等のショートカット遮断")
+        {
+            Checked = _config.BlockShellShortcuts,
+            CheckOnClick = true
+        };
+        shellGuardItem.CheckedChanged += (_, _) =>
+        {
+            _config.BlockShellShortcuts = shellGuardItem.Checked;
+            _config.SaveUserSettings();
+        };
+        _contextMenu.Items.Add(shellGuardItem);
 
         _contextMenu.Items.Add(new ToolStripSeparator());
 
-        var openBrowserItem = new ToolStripMenuItem($"ローカルブラウザで開く ({GetLocalBrowserUrl()})");
+        // 設定ダイアログを開く
+        var openSettingsItem = new ToolStripMenuItem("設定 (ネットワーク・認証・Kiosk保護)...");
+        openSettingsItem.Click += (_, _) => ShowSettingsDialog();
+        _contextMenu.Items.Add(openSettingsItem);
+
+        var openBrowserItem = new ToolStripMenuItem($"ローカルブラウザで開く ({GetLocalBrowserDisplayUrl()})");
         openBrowserItem.Click += (_, _) =>
         {
             try
@@ -95,16 +120,17 @@ public sealed class TrayApplicationContext : ApplicationContext
             };
             string dispTitle = string.IsNullOrWhiteSpace(title) ? "(未選択)" : title;
             _statusItem.Text = $"現在の対象: {dispTitle} ({stateJa})";
+            cursorItem.Checked = _config.CaptureCursor;
+            shellGuardItem.Checked = _config.BlockShellShortcuts;
             RebuildModeMenu();
             RebuildQualityMenu();
             RebuildFpsMenu();
         };
 
-        string initialTarget = string.IsNullOrWhiteSpace(_config.TargetWindowTitle) ? "未選択" : _config.TargetWindowTitle;
         _notifyIcon = new NotifyIcon
         {
             Icon = _appIcon,
-            Text = $"Single-App Remote ({initialTarget})",
+            Text = FormatNotifyIconText(_config.TargetWindowTitle),
             ContextMenuStrip = _contextMenu,
             Visible = true
         };
@@ -118,37 +144,95 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         };
 
-        _config.TargetChanged += () =>
+        _targetChangedHandler = () =>
         {
-            string t = string.IsNullOrWhiteSpace(_config.TargetWindowTitle) ? "未選択" : _config.TargetWindowTitle;
-            string txt = $"Single-App Remote ({t})";
-            _notifyIcon.Text = txt.Length > 63 ? txt[..63] : txt;
+            void UpdateText()
+            {
+                if (_notifyIcon.Visible)
+                {
+                    _notifyIcon.Text = FormatNotifyIconText(_config.TargetWindowTitle);
+                }
+            }
+
+            if (_uiSyncContext != null && SynchronizationContext.Current != _uiSyncContext)
+            {
+                _uiSyncContext.Post(_ => UpdateText(), null);
+            }
+            else
+            {
+                UpdateText();
+            }
         };
+        _config.TargetChanged += _targetChangedHandler;
     }
 
-    private string GetLocalBrowserUrl()
+    private static string FormatNotifyIconText(string? targetTitle)
+    {
+        string t = string.IsNullOrWhiteSpace(targetTitle) ? "未選択" : targetTitle;
+        string txt = $"Single-App Remote ({t})";
+        if (txt.Length <= 63) return txt;
+        int cut = char.IsHighSurrogate(txt[62]) ? 62 : 63;
+        return txt[..cut];
+    }
+
+    private string GetLocalBrowserDisplayUrl()
         => _listenUrl.Replace("0.0.0.0", "localhost").Replace("*", "localhost").Replace("+", "localhost");
+
+    private string GetLocalBrowserUrl()
+    {
+        string baseUrl = GetLocalBrowserDisplayUrl().TrimEnd('/');
+        string token = _config.AccessToken;
+        if (!string.IsNullOrEmpty(token))
+        {
+            return $"{baseUrl}/?token={Uri.EscapeDataString(token)}";
+        }
+        return baseUrl;
+    }
 
     private void ShowWindowPickerDialog()
     {
-        if (_activePickerDialog != null && !_activePickerDialog.IsDisposed)
+        if (_activeDialog != null && !_activeDialog.IsDisposed)
         {
-            _activePickerDialog.Activate();
+            _activeDialog.Activate();
             return;
         }
 
         using var dlg = new WindowPickerDialog(_config.TargetHwnd, _appIcon);
-        _activePickerDialog = dlg;
+        _activeDialog = dlg;
+        _config.IsHostDialogOpen = true;
         try
         {
             if (dlg.ShowDialog() == DialogResult.OK && dlg.SelectedWindow is { } selected)
             {
-                _config.SetTargetWindow(selected.Hwnd, selected.Title);
+                _config.SetTargetWindow(selected.Hwnd, selected.Title, selected.ProcessName);
             }
         }
         finally
         {
-            _activePickerDialog = null;
+            _config.IsHostDialogOpen = false;
+            _activeDialog = null;
+        }
+    }
+
+    private void ShowSettingsDialog()
+    {
+        if (_activeDialog != null && !_activeDialog.IsDisposed)
+        {
+            _activeDialog.Activate();
+            return;
+        }
+
+        using var dlg = new SettingsDialog(_config, _appIcon);
+        _activeDialog = dlg;
+        _config.IsHostDialogOpen = true;
+        try
+        {
+            dlg.ShowDialog();
+        }
+        finally
+        {
+            _config.IsHostDialogOpen = false;
+            _activeDialog = null;
         }
     }
 
@@ -166,7 +250,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             Checked = _config.CurrentInputMode == mode
         };
-        item.Click += (_, _) => _config.CurrentInputMode = mode;
+        item.Click += (_, _) =>
+        {
+            _config.CurrentInputMode = mode;
+            _config.SaveUserSettings();
+        };
         _modeMenu.DropDownItems.Add(item);
     }
 
@@ -179,7 +267,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 Checked = _config.JpegQuality == q
             };
-            item.Click += (_, _) => _config.JpegQuality = q;
+            item.Click += (_, _) =>
+            {
+                _config.JpegQuality = q;
+                _config.SaveUserSettings();
+            };
             _qualityMenu.DropDownItems.Add(item);
         }
     }
@@ -193,7 +285,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 Checked = _config.TargetFps == fps
             };
-            item.Click += (_, _) => _config.TargetFps = fps;
+            item.Click += (_, _) =>
+            {
+                _config.TargetFps = fps;
+                _config.SaveUserSettings();
+            };
             _fpsMenu.DropDownItems.Add(item);
         }
     }
@@ -210,6 +306,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (disposing)
         {
+            _config.TargetChanged -= _targetChangedHandler;
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _contextMenu.Dispose();
